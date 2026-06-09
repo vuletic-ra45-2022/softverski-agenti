@@ -62,7 +62,14 @@ library
     import:           warnings
 
     -- Modules exported by the library.
-    exposed-modules:  Control.Actor
+    exposed-modules:
+      Control.Actor
+      Control.Actor.Types
+      Control.Actor.Transport
+      Control.Actor.Runtime
+      Control.Actor.Core
+      Control.Actor.Supervision
+      Control.Actor.Network
 
     -- Modules included in this library but not exported.
     -- other-modules:
@@ -71,7 +78,7 @@ library
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.18.3.0, stm, uuid, bytestring ^>=0.12.0.0, containers ^>=0.8, mtl ^>=2.3.0, binary ^>=0.8.9
+    build-depends:    base ^>=4.18.3.0, stm, uuid, bytestring ^>=0.12.0.0, containers ^>=0.8, mtl ^>=2.3.0, binary ^>=0.8.9, network ^>=3.2
 
     -- Directories containing source files.
     hs-source-dirs:   src
