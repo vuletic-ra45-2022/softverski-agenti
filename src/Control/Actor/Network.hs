@@ -29,8 +29,10 @@ import Control.Concurrent.STM
   , readTMVar
   , readTVar
   , readTVarIO
+  , tryPutTMVar
   , tryTakeTMVar
   , writeTQueue
+  , writeTVar
   )
 import Control.Exception (SomeException, try)
 import Control.Monad (forM_, forever, unless, void)
@@ -112,7 +114,7 @@ handleNewConn ch = do
           Nothing -> return ()
           Just p  -> do
             modifyTVar (rtConnPromises rt) (Map.delete peerAddr)
-            putTMVar p ref
+            void $ tryPutTMVar p ref
     _else -> liftIO $ chClose ch
 
 -- Connection pool
@@ -140,9 +142,11 @@ getOrCreateConn peer = do
       liftIO $ chSend ch (encode (NMHandshake (rtNodeId rt)))
       ref <- spawnConnTree peer ch
       liftIO $ atomically $ do
-        modifyTVar (rtConnections rt) (Map.insert peer ref)
+        conns <- readTVar (rtConnections rt)
+        unless (Map.member peer conns) $
+          modifyTVar (rtConnections rt) (Map.insert peer ref)
         modifyTVar (rtConnPromises rt) (Map.delete peer)
-        putTMVar promise ref
+        void $ tryPutTMVar promise ref
       return ref
 
 -- Message dispatch
