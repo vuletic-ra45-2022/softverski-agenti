@@ -28,6 +28,7 @@ import Network.Socket
   , listen
   , setSocketOption
   , socket
+  , socketPort
   )
 import Network.Socket.ByteString.Lazy (recv, sendAll)
 
@@ -72,7 +73,7 @@ connectTcp (NodeAddr host port) = do
       connect sock (addrAddress a)
       return sock
 
-listenTcp :: NodeAddr -> IO Socket
+listenTcp :: NodeAddr -> IO (Socket, NodeAddr)
 listenTcp (NodeAddr host port) = do
   let hints = defaultHints {addrFlags = [AI_PASSIVE], addrSocketType = Stream}
   addrs <- getAddrInfo (Just hints) (Just host) (Just (show port))
@@ -83,24 +84,29 @@ listenTcp (NodeAddr host port) = do
       setSocketOption sock ReuseAddr 1
       bind sock (addrAddress a)
       listen sock 128
-      return sock
+      actualPort <- fromIntegral <$> socketPort sock
+      return (sock, NodeAddr host actualPort)
 
-createTCPTransport :: NodeAddr -> IO Transport
+-- | Create a TCP transport bound to the given address.
+-- Pass port 0 to let the OS pick a free port.
+-- Returns the transport and the address actually bound (with the real port).
+createTCPTransport :: NodeAddr -> IO (Transport, NodeAddr)
 createTCPTransport myAddr = do
-  lsock <- listenTcp myAddr
-  return Transport
-    { tConnect = \peer -> do
-        sock <- connectTcp peer
-        return ConnHandle
-          { chSend  = sendFramed sock
-          , chRecv  = recvFramed sock
-          , chClose = close sock
-          }
-    , tListen = \callback -> void $ forkIO $ forever $ do
-        (csock, _) <- accept lsock
-        void $ forkIO $ callback ConnHandle
-          { chSend  = sendFramed csock
-          , chRecv  = recvFramed csock
-          , chClose = close csock
-          }
-    }
+  (lsock, actualAddr) <- listenTcp myAddr
+  let transport = Transport
+        { tConnect = \peer -> do
+            sock <- connectTcp peer
+            return ConnHandle
+              { chSend  = sendFramed sock
+              , chRecv  = recvFramed sock
+              , chClose = close sock
+              }
+        , tListen = \callback -> void $ forkIO $ forever $ do
+            (csock, _) <- accept lsock
+            void $ forkIO $ callback ConnHandle
+              { chSend  = sendFramed csock
+              , chRecv  = recvFramed csock
+              , chClose = close csock
+              }
+        }
+  return (transport, actualAddr)

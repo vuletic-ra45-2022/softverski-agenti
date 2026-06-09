@@ -21,6 +21,7 @@ import Data.Map qualified as Map
 
 data Runtime = Runtime
   { rtNodeId       :: NodeAddr
+  , rtNextNodeId   :: TVar NodeId
   , rtActors       :: TVar (Map.Map ActorId (ThreadId, SomeActorRef))
   , rtPending      :: TVar (Map.Map CorrelationId (MVar ByteString))
   , rtNextCorr     :: TVar CorrelationId
@@ -41,10 +42,12 @@ newRuntime myAddr transport = do
   pending   <- newTVarIO Map.empty
   nextCorr  <- newTVarIO (0 :: Integer)
   nodeTable <- newTVarIO Map.empty
+  nextNid   <- newTVarIO (1 :: NodeId)
   conns     <- newTVarIO Map.empty
   promises  <- newTVarIO Map.empty
   return Runtime
     { rtNodeId       = myAddr
+    , rtNextNodeId   = nextNid
     , rtActors       = actors
     , rtPending      = pending
     , rtNextCorr     = nextCorr
