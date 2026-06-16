@@ -5,6 +5,8 @@ module Control.Actor
   , module Control.Actor.Core
   , module Control.Actor.Supervision
   , module Control.Actor.Network
+  , pass
+  , continue
   -- Demo
   , pingActor
   , forwardActorWithCell
@@ -25,8 +27,15 @@ import Control.Concurrent.STM
   ( TMVar, TVar
   , atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVarIO, writeTQueue, writeTVar
   )
+import Control.Monad ((<=<))
 import Control.Monad.Reader (MonadIO (..))
 import Unsafe.Coerce (unsafeCoerce)
+
+continue :: r -> Actor u r
+continue x = (,) (Just x) <$> state
+
+pass :: Actor u r
+pass = (,) Nothing <$> state
 
 -- Demo
 
@@ -72,18 +81,12 @@ system = do
 
 -- Network demo
 
-replyWith :: r -> Actor u r
-replyWith x = do
-  s <- state
-  return (Just x, s)
-
-pass :: Actor u r
-pass = state >>= (return . (,) Nothing)
-
+newNodeActor :: NodeAddr -> Actor () NodeId
+newNodeActor = continue <=< liftRuntime . connect Nothing
 
 -- | Actor on node 2: echo — returns whatever it received.
 echoActor :: String -> Actor () String
-echoActor = replyWith
+echoActor = continue
 
 -- | Actor on node 2: printer — side-effects only.
 printerActor :: String -> Actor () ()
