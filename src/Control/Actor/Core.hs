@@ -6,6 +6,8 @@ module Control.Actor.Core
   , state
   , getSelf
   , Actor
+  , ActorResult (..)
+  , Handler
   , liftRuntime
   , notifyOfDeath
   , spawnActor
@@ -44,6 +46,7 @@ import Control.Exception
   , try
   )
 import Control.Monad (forM_, void)
+import Data.Maybe (fromMaybe)
 import Control.Monad.Reader
   ( MonadIO (..)
   , MonadReader (..)
@@ -78,7 +81,15 @@ getSelf = do
     Just ref -> return ref
     Nothing  -> error "getSelf: actor not found in runtime"
 
-type Actor u r = ActorM u (Maybe r, u)
+data ActorResult msg u r = ActorResult
+  { actorReply  :: Maybe r
+  , actorState  :: u
+  , actorBecome :: Maybe (msg -> ActorM u (ActorResult msg u r))
+  }
+
+type Actor msg u r = ActorM u (ActorResult msg u r)
+
+type Handler msg u r = msg -> Actor msg u r
 
 liftRuntime :: RuntimeM a -> ActorM u a
 liftRuntime = ActorM . withReaderT snd . unRuntimeM
@@ -90,7 +101,7 @@ notifyOfDeath rt dm (RemoteTarget _ peerAddr) =
 
 spawnActor ::
   (Binary m, Binary r) =>
-  (m -> Actor u r) ->
+  Handler m u r ->
   (DeathMessage -> ActorM u (SupervisorAction u)) ->
   u ->
   RuntimeM (ActorRef m r)
@@ -104,7 +115,7 @@ spawnActor actorFn deathFn initState = do
       actorState = ActorState actorId links initState
       actorRef   = LocalRef mailbox deathQ actorState
 
-  let loop as = do
+  let loop fn as = do
         event <-
           atomically $
             (Left <$> readTQueue mailbox)
@@ -113,20 +124,20 @@ spawnActor actorFn deathFn initState = do
           Left envelope ->
             case envelope of
               Cast msg -> do
-                (_, u') <- runActorM (actorFn msg) rt as
-                loop as {asEnv = u'}
+                ActorResult _ u' mFn <- runActorM (fn msg) rt as
+                loop (fromMaybe fn mFn) as {asEnv = u'}
               Call msg mv -> do
-                (reply, u') <- runActorM (actorFn msg) rt as
+                ActorResult reply u' mFn <- runActorM (fn msg) rt as
                 putMVar mv reply
-                loop as {asEnv = u'}
+                loop (fromMaybe fn mFn) as {asEnv = u'}
           Right dm -> do
             action <- runActorM (deathFn dm) rt as
             case action of
               Stop       -> return ()
-              Continue u -> loop as {asEnv = u}
+              Continue u -> loop fn as {asEnv = u}
 
   tid <- liftIO $ forkIO $ do
-    result <- try @SomeException (loop actorState)
+    result <- try @SomeException (loop actorFn actorState)
     let reason = case result of
           Right () -> Normal
           Left exc -> case fromException exc of

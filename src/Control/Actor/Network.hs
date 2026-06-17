@@ -14,7 +14,7 @@ module Control.Actor.Network
   ) where
 
 import Control.Actor.Core
-  ( Actor, ActorM, cast', liftRuntime, linkActorTo, spawnActor, state, stopOnDeath )
+  ( Actor, ActorM, ActorResult (..), Handler, cast', liftRuntime, linkActorTo, spawnActor, state, stopOnDeath )
 import Control.Actor.Runtime (Runtime (..), RuntimeM, newRuntime, withRuntime)
 import Control.Actor.Supervision (ChildSpec (..), RestartStrategy (..), childWithRef, supervise')
 import Control.Actor.Transport (ConnHandle (..), Transport (..), createTCPTransport)
@@ -45,11 +45,11 @@ import Data.UUID (UUID)
 
 -- Connection actors
 
-connActorFn :: NetworkMessage -> Actor ConnHandle ()
+connActorFn :: Handler NetworkMessage ConnHandle ()
 connActorFn nm = do
   ch <- state
   liftIO $ chSend ch (encode nm)
-  return (Nothing, ch)
+  return $ ActorResult Nothing ch Nothing
 
 connDeathFn :: NodeAddr -> DeathMessage -> ActorM ConnHandle (SupervisorAction ConnHandle)
 connDeathFn peer _ = do
@@ -60,12 +60,12 @@ connDeathFn peer _ = do
     chClose ch
   return Stop
 
-routerActorFn :: NodeAddr -> ByteString -> Actor () ()
+routerActorFn :: NodeAddr -> Handler ByteString () ()
 routerActorFn senderAddr raw = do
   let nm = decode raw :: NetworkMessage
   valid <- liftRuntime $ validateAndDispatch senderAddr nm
   unless valid $ liftIO $ putStrLn "router: dropping invalid message"
-  return (Nothing, ())
+  return $ ActorResult Nothing () Nothing
 
 -- Connection supervision tree
 
@@ -242,8 +242,8 @@ validateAndDispatch senderAddr nm = case nm of
 
 -- System event handler
 
-sysHandlerFn :: NetworkMessage -> Actor () ()
-sysHandlerFn _ = return (Nothing, ())
+sysHandlerFn :: Handler NetworkMessage () ()
+sysHandlerFn _ = return $ ActorResult Nothing () Nothing
 
 -- Node connection
 

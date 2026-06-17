@@ -7,6 +7,8 @@ module Control.Actor
   , module Control.Actor.Network
   , pass
   , continue
+  , maybeContinue
+  , become
   -- Demo
   , pingActor
   , forwardActorWithCell
@@ -31,33 +33,40 @@ import Control.Monad ((<=<))
 import Control.Monad.Reader (MonadIO (..))
 import Unsafe.Coerce (unsafeCoerce)
 
-continue :: r -> Actor u r
-continue x = (,) (Just x) <$> state
+continue :: r -> Actor msg u r
+continue x = (\u -> ActorResult (Just x) u Nothing) <$> state
 
-pass :: Actor u r
-pass = (,) Nothing <$> state
+maybeContinue :: Maybe r -> Actor msg u r
+maybeContinue Nothing = pass
+maybeContinue (Just r) = continue r
+
+pass :: Actor msg u r
+pass = (\u -> ActorResult Nothing u Nothing) <$> state
+
+become :: Handler msg u r -> Actor msg u r
+become fn = (\u -> ActorResult Nothing u (Just fn)) <$> state
 
 -- Demo
 
-pingActor :: String -> Actor () String
-pingActor msg = return (Just ("Hello, " <> msg <> "!"), ())
+pingActor :: Handler String () String
+pingActor msg = continue ("Hello, " <> msg <> "!")
 
-forwardActorWithCell :: TMVar (ActorRef String String) -> String -> Actor () String
+forwardActorWithCell :: TMVar (ActorRef String String) -> Handler String () String
 forwardActorWithCell cell msg = do
   pingRef <- liftIO $ atomically $ readTMVar cell
   reply   <- call msg pingRef
   case reply of
     Nothing -> liftIO $ putStrLn "forwardActorWithCell: received empty reply!"
     Just x  -> liftIO $ putStrLn ("forwardActorWithCell: received reply - " <> x)
-  return (reply, ())
+  maybeContinue reply
 
-repeatActor :: String -> TMVar (ActorRef String String) -> () -> Actor () String
+repeatActor :: String -> TMVar (ActorRef String String) -> Handler () () String
 repeatActor r cell () = do
   ref             <- liftIO $ atomically $ readTMVar cell
   (SomeActorRef self) <- getSelf
   cast r ref
   castIn 1000 () (unsafeCoerce self)
-  return (Nothing, ())
+  pass
 
 system :: IO ()
 system = do
@@ -81,25 +90,25 @@ system = do
 
 -- Network demo
 
-newNodeActor :: NodeAddr -> Actor () NodeId
+newNodeActor :: Handler NodeAddr () NodeId
 newNodeActor = continue <=< liftRuntime . connect Nothing
 
 -- | Actor on node 2: echo — returns whatever it received.
-echoActor :: String -> Actor () String
+echoActor :: Handler String () String
 echoActor = continue
 
 -- | Actor on node 2: printer — side-effects only.
-printerActor :: String -> Actor () ()
+printerActor :: Handler String () ()
 printerActor msg = liftIO (putStrLn $ "  [remote/print] " <> msg) >> pass
 
 -- | Trivial actor used as a stub when we only care about death notifications.
-noopActor :: () -> Actor () ()
-noopActor _ = return (Nothing, ())
+noopActor :: Handler () () ()
+noopActor _ = pass
 
 -- | Captures the received string into a TVar (used as a node-1 receiver actor).
-recvActorFn :: TVar (Maybe String) -> String -> Actor () ()
+recvActorFn :: TVar (Maybe String) -> Handler String () ()
 recvActorFn var msg =
-  liftIO (atomically $ writeTVar var (Just msg)) >> return (Nothing, ())
+  liftIO (atomically $ writeTVar var (Just msg)) >> pass
 
 -- | End-to-end networking demo.
 --
