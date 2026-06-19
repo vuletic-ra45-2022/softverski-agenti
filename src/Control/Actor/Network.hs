@@ -10,16 +10,17 @@ module Control.Actor.Network
   , routeRemoteDeath
   , validateAndDispatch
   , sysHandlerFn
-  , initRuntime
+  , createTCPTransport
   ) where
 
 import Control.Actor.Core
-  ( Actor, ActorM, ActorResult (..), Handler, cast', liftRuntime, linkActorTo, spawnActor, state, stopOnDeath )
-import Control.Actor.Runtime (Runtime (..), RuntimeM, newRuntime, withRuntime)
+  ( ActorM, ActorResult (..), Handler, cast', liftRuntime, linkActorTo
+  , spawnActor, state, stopOnDeath )
+import Control.Actor.Runtime (Runtime (..), RuntimeM, addrToNodeId, withRuntime)
 import Control.Actor.Supervision (ChildSpec (..), RestartStrategy (..), childWithRef, supervise')
 import Control.Actor.Transport (ConnHandle (..), Transport (..), createTCPTransport)
 import Control.Actor.Types
-import Control.Concurrent (ThreadId, forkIO)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
@@ -41,7 +42,7 @@ import Control.Monad.Reader (MonadIO (..), MonadReader (..))
 import Data.Binary (decode, decodeOrFail, encode)
 import Data.ByteString.Lazy (ByteString)
 import Data.Map qualified as Map
-import Data.UUID (UUID)
+import Data.Maybe (fromMaybe)
 
 -- Connection actors
 
@@ -152,20 +153,12 @@ getOrCreateConn peer = do
 
 -- Message dispatch
 
-findByUUID :: UUID -> Map.Map ActorId (ThreadId, SomeActorRef) -> Maybe SomeActorRef
-findByUUID uuid actors =
-  case Map.toList (Map.filterWithKey (\(ActorId _ u) _ -> u == uuid) actors) of
-    []            -> Nothing
-    (_, (_, r)):_ -> Just r
-
 routeRemoteDeath :: NodeAddr -> ActorId -> RemoteExitReason -> RuntimeM ()
 routeRemoteDeath senderAddr (ActorId _ uuid) reason = do
-  rt <- ask
+  rt           <- ask
+  mSenderNid   <- addrToNodeId senderAddr
   liftIO $ do
-    localNodeId <- atomically $ do
-      table <- readTVar (rtNodeTable rt)
-      return $ Map.foldrWithKey (\k v acc -> if v == senderAddr then Just k else acc) Nothing table
-    let deadId     = ActorId (case localNodeId of { Just n -> n; Nothing -> 0 }) uuid
+    let deadId     = ActorId (fromMaybe 0 mSenderNid) uuid
         exitReason = case reason of
           RNormal      -> Normal
           RKilled      -> Killed
@@ -177,9 +170,9 @@ routeRemoteDeath senderAddr (ActorId _ uuid) reason = do
         LocalRef {arDeathQ, arState} -> do
           links <- readTVarIO (asLinks arState)
           forM_ links $ \case
-            RemoteTarget (ActorId _ uid) peerAddr
-              | uid == uuid && peerAddr == senderAddr ->
-                atomically $ writeTQueue arDeathQ dm
+            RemoteTarget (ActorId _ uid) nodeId
+              | uid == uuid && Just nodeId == mSenderNid ->
+                  atomically $ writeTQueue arDeathQ dm
             _else -> return ()
         RemoteRef _ -> return ()
 
@@ -198,6 +191,7 @@ validateAndDispatch senderAddr nm = case nm of
 
   NMCast uuid payload -> do
     rt <- ask
+    rid <- remoteNodeId
     liftIO $ do
       actors <- readTVarIO (rtActors rt)
       case findByUUID uuid actors of
@@ -207,13 +201,14 @@ validateAndDispatch senderAddr nm = case nm of
           case decodeOrFail payload of
             Left _            -> return False
             Right (_, _, msg) -> do
-              atomically $ writeTQueue arMsgQ (Cast msg)
+              atomically $ writeTQueue arMsgQ (rid, Cast msg)
               return True
         Just (SomeActorRef (RemoteRef _)) ->
           return False
 
   NMCall uuid corrId returnAddr payload -> do
     rt <- ask
+    rid <- remoteNodeId
     liftIO $ do
       actors <- readTVarIO (rtActors rt)
       case findByUUID uuid actors of
@@ -224,7 +219,7 @@ validateAndDispatch senderAddr nm = case nm of
             Left _            -> return False
             Right (_, _, msg) -> do
               mv <- newEmptyMVar
-              atomically $ writeTQueue arMsgQ (Call msg mv)
+              atomically $ writeTQueue arMsgQ (rid, Call msg mv)
               void $ forkIO $ do
                 reply <- takeMVar mv
                 case reply of
@@ -239,6 +234,9 @@ validateAndDispatch senderAddr nm = case nm of
   NMDeath deadId reason -> do
     routeRemoteDeath senderAddr deadId reason
     return True
+
+  where
+    remoteNodeId = fromMaybe thisNodeId <$> addrToNodeId senderAddr
 
 -- System event handler
 
@@ -264,18 +262,3 @@ connect suggestedId peer = do
     return assigned
   void $ getOrCreateConn peer
   return nodeId
-
--- Runtime initialization
-
-initRuntime :: NodeAddr -> IO Runtime
-initRuntime myAddr = do
-  (transport, actualAddr) <- createTCPTransport myAddr
-  rt0 <- newRuntime actualAddr transport
-  let rt = rt0 { rtSendRemote = \addr nm -> getOrCreateConn addr >>= cast' nm }
-  withRuntime rt $ void $ spawnActor sysHandlerFn stopOnDeath ()
-  tListen transport $ \ch -> do
-    result <- try @SomeException $ withRuntime rt $ handleNewConn ch
-    case result of
-      Left _   -> chClose ch
-      Right () -> return ()
-  return rt

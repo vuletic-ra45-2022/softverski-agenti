@@ -16,9 +16,12 @@ module Control.Actor.Types
   , ActorRef (..)
   , SomeActorRef (..)
   , someActorId
+  , actorRefId
   , SupervisorAction (..)
   , CorrelationId
   , Envelope (..)
+  , RegistryMsg (..)
+  , findByUUID
   ) where
 
 import Control.Concurrent.MVar (MVar)
@@ -28,6 +31,8 @@ import Data.Binary (Binary)
 import Data.ByteString.Lazy (ByteString)
 import Data.UUID (UUID)
 import GHC.Generics (Generic)
+import Data.Map qualified as Map
+import Control.Concurrent (ThreadId)
 
 data NodeAddr = NodeAddr
   { nodeHost :: String
@@ -59,7 +64,7 @@ data DeathMessage = DeathMessage
 
 data DeathTarget
   = LocalTarget (TQueue DeathMessage)
-  | RemoteTarget ActorId NodeAddr
+  | RemoteTarget ActorId NodeId
 
 data RemoteExitReason
   = RNormal
@@ -88,6 +93,7 @@ data ActorState u = ActorState
   { asId    :: ActorId
   , asLinks :: TVar [DeathTarget]
   , asEnv   :: u
+  , asLatestFrom :: NodeId
   }
 
 type CorrelationId = Integer
@@ -98,7 +104,7 @@ data Envelope msg reply
 
 data ActorRef msg reply
   = forall u. LocalRef
-      { arMsgQ   :: TQueue (Envelope msg reply)
+      { arMsgQ   :: TQueue (NodeId, Envelope msg reply)
       , arDeathQ :: TQueue DeathMessage
       , arState  :: ActorState u
       }
@@ -110,6 +116,25 @@ someActorId :: SomeActorRef -> ActorId
 someActorId (SomeActorRef (LocalRef {arState})) = asId arState
 someActorId (SomeActorRef (RemoteRef aid))      = aid
 
+actorRefId :: ActorRef msg r -> ActorId
+actorRefId (LocalRef {arState}) = asId arState
+actorRefId (RemoteRef aid)      = aid
+
 data SupervisorAction u
   = Stop
   | Continue u
+
+data RegistryMsg
+  = RMRegister   String UUID
+  | RMLookup     String
+  | RMDeregister String
+  | RMDeath      UUID
+  deriving (Generic)
+
+instance Binary RegistryMsg
+
+findByUUID :: UUID -> Map.Map ActorId (ThreadId, SomeActorRef) -> Maybe SomeActorRef
+findByUUID uuid actors =
+  case Map.toList (Map.filterWithKey (\(ActorId _ u) _ -> u == uuid) actors) of
+    []            -> Nothing
+    (_, (_, r)):_ -> Just r

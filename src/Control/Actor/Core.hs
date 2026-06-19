@@ -11,6 +11,7 @@ module Control.Actor.Core
   , liftRuntime
   , notifyOfDeath
   , spawnActor
+  , spawnActorAs
   , linkActorTo
   , linkTo
   , killActor
@@ -20,6 +21,12 @@ module Control.Actor.Core
   , cast
   , call
   , castIn
+  , pass
+  , passWith
+  , continue
+  , maybeContinue
+  , become
+  , lastMessageFrom
   ) where
 
 import Control.Actor.Runtime
@@ -56,6 +63,7 @@ import Control.Monad.Reader
   )
 import Data.Binary (Binary, decode, encode)
 import Data.Map qualified as Map
+import Data.UUID (UUID)
 import Data.UUID.V4 (nextRandom)
 
 newtype ActorM u r = ActorM
@@ -70,6 +78,9 @@ runActorM m rt s = runReaderT (unActorM m) (s, rt)
 
 state :: ActorM u u
 state = asks (asEnv . fst)
+
+lastMessageFrom :: ActorM u NodeId
+lastMessageFrom = asks (asLatestFrom . fst)
 
 getSelf :: ActorM u SomeActorRef
 getSelf = do
@@ -95,24 +106,28 @@ liftRuntime :: RuntimeM a -> ActorM u a
 liftRuntime = ActorM . withReaderT snd . unRuntimeM
 
 notifyOfDeath :: Runtime -> DeathMessage -> DeathTarget -> IO ()
-notifyOfDeath _  dm (LocalTarget q)           = atomically $ writeTQueue q dm
-notifyOfDeath rt dm (RemoteTarget _ peerAddr) =
-  withRuntime rt $ rtSendRemote rt peerAddr (NMDeath (dmActorId dm) (toRemoteExitReason (dmReason dm)))
+notifyOfDeath _  dm (LocalTarget q)         = atomically $ writeTQueue q dm
+notifyOfDeath rt dm (RemoteTarget _ nodeId) =
+  withRuntime rt $ do
+    maybeAddr <- lookupNode nodeId
+    case maybeAddr of
+      Nothing   -> return ()
+      Just addr -> rtSendRemote rt addr (NMDeath (dmActorId dm) (toRemoteExitReason (dmReason dm)))
 
-spawnActor ::
+spawnActorAs ::
   (Binary m, Binary r) =>
+  UUID ->
   Handler m u r ->
   (DeathMessage -> ActorM u (SupervisorAction u)) ->
   u ->
   RuntimeM (ActorRef m r)
-spawnActor actorFn deathFn initState = do
+spawnActorAs uuid actorFn deathFn initState = do
   rt      <- ask
   mailbox <- liftIO newTQueueIO
   deathQ  <- liftIO newTQueueIO
   links   <- liftIO $ newTVarIO []
-  uuid    <- liftIO nextRandom
   let actorId    = ActorId thisNodeId uuid
-      actorState = ActorState actorId links initState
+      actorState = ActorState actorId links initState thisNodeId
       actorRef   = LocalRef mailbox deathQ actorState
 
   let loop fn as = do
@@ -123,11 +138,11 @@ spawnActor actorFn deathFn initState = do
         case event of
           Left envelope ->
             case envelope of
-              Cast msg -> do
-                ActorResult _ u' mFn <- runActorM (fn msg) rt as
+              (from, Cast msg) -> do
+                ActorResult _ u' mFn <- runActorM (fn msg) rt as {asLatestFrom = from}
                 loop (fromMaybe fn mFn) as {asEnv = u'}
-              Call msg mv -> do
-                ActorResult reply u' mFn <- runActorM (fn msg) rt as
+              (from, Call msg mv) -> do
+                ActorResult reply u' mFn <- runActorM (fn msg) rt as {asLatestFrom = from}
                 putMVar mv reply
                 loop (fromMaybe fn mFn) as {asEnv = u'}
           Right dm -> do
@@ -154,6 +169,16 @@ spawnActor actorFn deathFn initState = do
     modifyTVar (rtActors rt) (Map.insert actorId (tid, SomeActorRef actorRef))
   return actorRef
 
+spawnActor ::
+  (Binary m, Binary r) =>
+  Handler m u r ->
+  (DeathMessage -> ActorM u (SupervisorAction u)) ->
+  u ->
+  RuntimeM (ActorRef m r)
+spawnActor actorFn deathFn initState = do
+  uuid <- liftIO nextRandom
+  spawnActorAs uuid actorFn deathFn initState
+
 linkActorTo :: DeathTarget -> ActorRef m r -> RuntimeM ()
 linkActorTo target (LocalRef {arState}) =
   liftIO $ atomically $ modifyTVar (asLinks arState) (target :)
@@ -175,7 +200,7 @@ stopOnDeath _ = return Stop
 
 cast' :: (Binary msg) => msg -> ActorRef msg reply -> RuntimeM ()
 cast' msg (LocalRef {arMsgQ}) =
-  liftIO $ atomically $ writeTQueue arMsgQ (Cast msg)
+  liftIO $ atomically $ writeTQueue arMsgQ (thisNodeId, Cast msg)
 cast' msg (RemoteRef (ActorId nodeId uuid)) = do
   rt <- ask
   maybeAddr <- lookupNode nodeId
@@ -186,7 +211,7 @@ cast' msg (RemoteRef (ActorId nodeId uuid)) = do
 call' :: (Binary msg, Binary reply) => msg -> ActorRef msg reply -> RuntimeM (Maybe reply)
 call' msg (LocalRef {arMsgQ}) = liftIO $ do
   mv <- newEmptyMVar
-  atomically $ writeTQueue arMsgQ (Call msg mv)
+  atomically $ writeTQueue arMsgQ (thisNodeId, Call msg mv)
   takeMVar mv
 call' msg (RemoteRef (ActorId nodeId uuid)) = do
   rt <- ask
@@ -220,3 +245,19 @@ castIn ms msg ref = do
 
 call :: (Binary msg, Binary reply) => msg -> ActorRef msg reply -> ActorM u (Maybe reply)
 call = (liftRuntime .) . call'
+
+continue :: r -> Actor msg u r
+continue x = (\u -> ActorResult (Just x) u Nothing) <$> state
+
+maybeContinue :: Maybe r -> Actor msg u r
+maybeContinue Nothing = pass
+maybeContinue (Just r) = continue r
+
+pass :: Actor msg u r
+pass = (\u -> ActorResult Nothing u Nothing) <$> state
+
+passWith :: u -> Actor msg u r
+passWith u = return (ActorResult Nothing u Nothing)
+
+become :: Handler msg u r -> Actor msg u r
+become fn = (\u -> ActorResult Nothing u (Just fn)) <$> state

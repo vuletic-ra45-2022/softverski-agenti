@@ -5,10 +5,6 @@ module Control.Actor
   , module Control.Actor.Core
   , module Control.Actor.Supervision
   , module Control.Actor.Network
-  , pass
-  , continue
-  , maybeContinue
-  , become
   -- Demo
   , pingActor
   , forwardActorWithCell
@@ -29,22 +25,26 @@ import Control.Concurrent.STM
   ( TMVar, TVar
   , atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVarIO, writeTQueue, writeTVar
   )
-import Control.Monad ((<=<))
+import Control.Monad ((<=<), void)
 import Control.Monad.Reader (MonadIO (..))
 import Unsafe.Coerce (unsafeCoerce)
+import Control.Exception (SomeException, try)
+import Control.Actor.Registry (createRegistry, registerActor, lookupRemoteActor)
 
-continue :: r -> Actor msg u r
-continue x = (\u -> ActorResult (Just x) u Nothing) <$> state
+initRuntime :: NodeAddr -> (NodeAddr -> IO (Transport, NodeAddr)) -> IO Runtime
+initRuntime myAddr createTransport = do
+  (transport, actualAddr) <- createTransport myAddr
+  rt0 <- newRuntime actualAddr transport
+  let rt = rt0 { rtSendRemote = \addr nm -> getOrCreateConn addr >>= cast' nm }
+  withRuntime rt $ void $ spawnActor sysHandlerFn stopOnDeath ()
+  withRuntime rt $ void createRegistry
+  tListen transport $ \ch -> do
+    result <- try @SomeException $ withRuntime rt $ handleNewConn ch
+    case result of
+      Left _   -> chClose ch
+      Right () -> return ()
+  return rt
 
-maybeContinue :: Maybe r -> Actor msg u r
-maybeContinue Nothing = pass
-maybeContinue (Just r) = continue r
-
-pass :: Actor msg u r
-pass = (\u -> ActorResult Nothing u Nothing) <$> state
-
-become :: Handler msg u r -> Actor msg u r
-become fn = (\u -> ActorResult Nothing u (Just fn)) <$> state
 
 -- Demo
 
@@ -70,7 +70,7 @@ repeatActor r cell () = do
 
 system :: IO ()
 system = do
-  rt <- initRuntime (NodeAddr "localhost" 9000)
+  rt <- initRuntime (NodeAddr "localhost" 9000) createTCPTransport
   withRuntime rt $ do
     pingCell    <- liftIO newEmptyTMVarIO
     forwardCell <- liftIO newEmptyTMVarIO
@@ -123,8 +123,8 @@ networkDemo = do
 
   -- Port 0 lets the OS pick a free port each run, avoiding stale-socket
   -- conflicts when re-running in the same GHCi session.
-  rt1 <- initRuntime (NodeAddr "localhost" 0)
-  rt2 <- initRuntime (NodeAddr "localhost" 0)
+  rt1 <- initRuntime (NodeAddr "localhost" 0) createTCPTransport
+  rt2 <- initRuntime (NodeAddr "localhost" 0) createTCPTransport
   let addr1 = rtNodeId rt1
       addr2 = rtNodeId rt2
 
@@ -133,27 +133,27 @@ networkDemo = do
   node2 <- withRuntime rt1 $ connect Nothing addr2
   node1 <- withRuntime rt2 $ connect Nothing addr1
 
-  -- Helper: build a RemoteRef that is visible from one node for an actor
-  -- that was spawned on a different node. The actor's own id uses NodeId 0
-  -- (self), but from the caller's node it is addressed by the assigned id.
-  let toRemote nid ref =
-        let ActorId _ u = someActorId (SomeActorRef ref)
-        in  RemoteRef (ActorId nid u)
-
-  -- Spawn workers on node 2.
+  -- Spawn and register workers on node 2.
   echoRef  <- withRuntime rt2 $ spawnActor echoActor   stopOnDeath ()
   printRef <- withRuntime rt2 $ spawnActor printerActor stopOnDeath ()
+  withRuntime rt2 $ registerActor "echo"    echoRef
+  withRuntime rt2 $ registerActor "printer" printRef
 
-  let remoteEcho  = toRemote node2 echoRef  :: ActorRef String String
-      remotePrint = toRemote node2 printRef :: ActorRef String ()
+  -- Small delay to let NMRegistryUpdate propagate to node 1.
+  threadDelay 100_000
 
   -- 1. Remote cast: fire-and-forget from node 1 to node 2.
   putStrLn "\n[1] remote cast  node 1 -> node 2"
+  Just remotePrint <- withRuntime rt1 $ lookupRemoteActor "printer"
   withRuntime rt1 $ cast' "hello from node 1" remotePrint
   threadDelay 300_000
 
   -- 2. Remote call: request/reply across nodes.
   putStrLn "\n[2] remote call  node 1 <-> node 2"
+  Just remoteEcho' <- withRuntime rt1 $ lookupRemoteActor "echo"
+  let
+    remoteEcho :: ActorRef String String
+    remoteEcho = (unsafeCoerce remoteEcho')
   reply <- withRuntime rt1 $ call' "ping" remoteEcho
   putStrLn $ "    reply: " <> show reply
 
@@ -161,7 +161,9 @@ networkDemo = do
   putStrLn "\n[3] reverse cast  node 2 -> node 1"
   recvVar <- newTVarIO (Nothing :: Maybe String)
   recvRef <- withRuntime rt1 $ spawnActor (recvActorFn recvVar) stopOnDeath ()
-  let remoteRecv = toRemote node1 recvRef :: ActorRef String ()
+  withRuntime rt1 $ registerActor "receiver" recvRef
+  threadDelay 100_000
+  Just remoteRecv <- withRuntime rt2 $ lookupRemoteActor "receiver"
   withRuntime rt2 $ cast' "hello from node 2" remoteRecv
   threadDelay 300_000
   readTVarIO recvVar >>= \v -> putStrLn $ "    received: " <> show v
@@ -184,13 +186,11 @@ networkDemo = do
   let mortalId = someActorId (SomeActorRef mortalRef)
       watchId  = someActorId (SomeActorRef watchRef)
 
-  -- mortalRef's links: on death, send NMDeath to node 1's address.
-  withRuntime rt2 $
-    linkActorTo (RemoteTarget watchId  addr1) mortalRef
+  -- mortalRef's links: on death, send NMDeath to node 1 (by NodeId).
+  withRuntime rt2 $ linkActorTo (RemoteTarget watchId  node1) mortalRef
   -- watchRef's links: declare interest in mortalId so routeRemoteDeath
   -- on node 1 can find this actor when NMDeath arrives.
-  withRuntime rt1 $
-    linkActorTo (RemoteTarget mortalId addr2) watchRef
+  withRuntime rt1 $ linkActorTo (RemoteTarget mortalId node2) watchRef
 
   -- Kill the mortal actor by posting directly to its death queue.
   case mortalRef of

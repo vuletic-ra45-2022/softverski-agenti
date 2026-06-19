@@ -16,7 +16,7 @@ module Control.Actor.Supervision
   , killSlot
   ) where
 
-import Control.Actor.Core (Actor, ActorM, Handler, liftRuntime, linkActorTo, spawnActor)
+import Control.Actor.Core (ActorM, Handler, liftRuntime, linkActorTo, spawnActor)
 import Control.Actor.Runtime (Runtime (..), RuntimeM, withRuntime)
 import Control.Actor.Types
 import Data.Binary (Binary)
