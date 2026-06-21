@@ -5,13 +5,14 @@ module Control.Actor.Registry
     registryUUID,
     registry,
     registerDeath,
+    deregisterNode,
     createRegistry,
   )
 where
 
 import Control.Actor.Core (ActorM, ActorResult (..), Handler, call, call', cast', liftRuntime, linkActorTo, pass, spawnActorAs, state, lastMessageFrom, cast, passWith)
 import Control.Actor.Runtime (Runtime (..), RuntimeM, getActorByUUID, withRuntime)
-import Control.Actor.Types (ActorId (..), ActorRef (..), DeathMessage (..), DeathTarget (LocalTarget), RegistryMsg (..), SomeActorRef (..), SupervisorAction (Continue), actorRefId, thisNodeId, findByUUID)
+import Control.Actor.Types (ActorId (..), ActorRef (..), DeathMessage (..), DeathTarget (LocalTarget), NodeId, RegistryMsg (..), SomeActorRef (..), SupervisorAction (Continue), actorRefId, thisNodeId, findByUUID)
 import Control.Concurrent.STM (readTVarIO)
 import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (MonadIO (liftIO))
@@ -41,6 +42,9 @@ registryHandlerFn (RMLookup name) = do
 registryHandlerFn (RMDeregister name) = do
   u <- state
   return $ ActorResult Nothing (Map.delete name u) Nothing
+registryHandlerFn (RMDeregisterNode nodeId) = do
+  u <- state
+  passWith (Map.filter (\(ActorId nid _) -> nid /= nodeId) u)
 registryHandlerFn msg@(RMDeath deadUUID) = do
   u <- state
   from <- lastMessageFrom
@@ -68,12 +72,20 @@ registryDeathFn (DeathMessage (ActorId _ deadUUID) _) = do
 
 registry :: RuntimeM (Maybe (ActorRef RegistryMsg (Maybe ActorId)))
 registry = do
-  unsafeCoerce $ getActorByUUID registryUUID
+  mRef <- getActorByUUID registryUUID
+  return $ case mRef of
+    Nothing                    -> Nothing
+    Just (SomeActorRef regRef) -> Just (unsafeCoerce regRef)
 
 registerDeath :: ActorId -> RuntimeM ()
 registerDeath (ActorId _ uuid) = do
   r <- registry
   mapM_ (cast' (RMDeath uuid)) r
+
+deregisterNode :: NodeId -> RuntimeM ()
+deregisterNode nodeId = do
+  r <- registry
+  mapM_ (cast' (RMDeregisterNode nodeId)) r
 
 registerActor :: String -> ActorRef msg r -> RuntimeM ()
 registerActor name ref = do
@@ -122,8 +134,6 @@ lookupRemoteActor name = do
       case result of
         Just (Just (ActorId 0 uuid)) ->
           return $ Just (RemoteRef (ActorId peerNodeId uuid))
-        Just (Just aid) ->
-          return $ Just (RemoteRef aid)
         _else -> go rest
 
 createRegistry :: RuntimeM (ActorRef RegistryMsg (Maybe ActorId))

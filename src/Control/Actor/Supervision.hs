@@ -23,10 +23,8 @@ import Data.Binary (Binary)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
   ( TMVar
-  , TQueue
   , TVar
   , atomically
-  , flushTQueue
   , modifyTVar
   , newTQueueIO
   , newTVarIO
@@ -36,13 +34,16 @@ import Control.Concurrent.STM
   , tryTakeTMVar
   , writeTVar
   )
-import Control.Monad (forever, void)
+import Control.Monad (void)
+import GHC.Clock (getMonotonicTime)
 import Control.Monad.Reader (MonadIO (..), MonadReader (..))
 import Data.Map qualified as Map
 
 data ChildSpec = forall m r. (Binary m, Binary r) => ChildSpec
   { csRun     :: DeathTarget -> RuntimeM (ActorRef m r)
-  , csOnSpawn :: ActorRef m r -> IO ()
+  -- | Runs after every (re)spawn — including supervisor restarts — so it can
+  -- refresh shared ref cells and re-register names.
+  , csOnSpawn :: ActorRef m r -> RuntimeM ()
   }
 
 child ::
@@ -73,7 +74,7 @@ childWithRef msgFn deathFn initState cell =
         ref <- spawnActor msgFn deathFn initState
         linkActorTo target ref
         return ref
-    , csOnSpawn = \ref -> atomically $ do
+    , csOnSpawn = \ref -> liftIO $ atomically $ do
         void $ tryTakeTMVar cell
         putTMVar cell ref
     }
@@ -91,7 +92,7 @@ spawnSlot :: DeathTarget -> ChildSpec -> RuntimeM ChildSlot
 spawnSlot target spec@ChildSpec {csRun, csOnSpawn} = do
   rt  <- ask
   ref <- csRun target
-  _   <- liftIO $ csOnSpawn ref
+  csOnSpawn ref
   let aid = someActorId (SomeActorRef ref)
   tid <- liftIO $ do
     actors <- readTVarIO (rtActors rt)
@@ -103,6 +104,15 @@ spawnSlot target spec@ChildSpec {csRun, csOnSpawn} = do
 killSlot :: ChildSlot -> IO ()
 killSlot ChildSlot {slotTid} = killThread slotTid
 
+-- | Max child restarts within 'restartWindow' seconds before the supervisor
+-- gives up and stops all children — otherwise a child that crashes right
+-- after spawning would respawn in a hot loop forever.
+restartLimit :: Int
+restartLimit = 5
+
+restartWindow :: Double
+restartWindow = 10
+
 supervise' :: RestartStrategy -> [ChildSpec] -> RuntimeM ()
 supervise' strategy specs = do
   rt        <- ask
@@ -110,13 +120,35 @@ supervise' strategy specs = do
   let target = LocalTarget supDeathQ
   slots    <- mapM (spawnSlot target) specs
   slotsVar <- liftIO $ newTVarIO slots
-  liftIO $ void $ forkIO $ forever $ do
-    DeathMessage deadId _ <- atomically $ readTQueue supDeathQ
-    slots' <- readTVarIO slotsVar
-    withRuntime rt $ case strategy of
-      OneForOne  -> doOneForOne target slotsVar slots' deadId
-      OneForAll  -> doOneForAll target slotsVar supDeathQ slots'
-      RestForOne -> doRestForOne target slotsVar supDeathQ slots' deadId
+  let loop restarts = do
+        DeathMessage deadId reason <- atomically $ readTQueue supDeathQ
+        slots' <- readTVarIO slotsVar
+        if all ((/= deadId) . slotId) slots'
+          -- Stale death: killSlot is asynchronous, so children replaced by a
+          -- OneForAll/RestForOne restart report their deaths after the fact.
+          -- Acting on one would kill the fresh children and cascade forever.
+          then loop restarts
+          else case reason of
+            -- A normal exit is completion, not a crash: drop the slot.
+            Normal -> do
+              atomically $ modifyTVar slotsVar (filter ((/= deadId) . slotId))
+              loop restarts
+            _crash -> do
+              now <- getMonotonicTime
+              let recent = filter (> now - restartWindow) restarts
+              if length recent >= restartLimit
+                then do
+                  putStrLn $ "supervisor: " <> show restartLimit
+                    <> " restarts within " <> show restartWindow
+                    <> "s, giving up"
+                  mapM_ killSlot slots'
+                else do
+                  withRuntime rt $ case strategy of
+                    OneForOne  -> doOneForOne target slotsVar slots' deadId
+                    OneForAll  -> doOneForAll target slotsVar slots'
+                    RestForOne -> doRestForOne target slotsVar slots' deadId
+                  loop (now : recent)
+  liftIO $ void $ forkIO $ loop []
 
 supervise :: RestartStrategy -> [ChildSpec] -> ActorM u ()
 supervise = (liftRuntime .) . supervise'
@@ -135,30 +167,24 @@ doOneForOne target slotsVar slots deadId =
 doOneForAll ::
   DeathTarget ->
   TVar [ChildSlot] ->
-  TQueue DeathMessage ->
   [ChildSlot] ->
   RuntimeM ()
-doOneForAll target slotsVar supDeathQ slots = do
-  liftIO $ do
-    mapM_ killSlot slots
-    atomically $ void $ flushTQueue supDeathQ
+doOneForAll target slotsVar slots = do
+  liftIO $ mapM_ killSlot slots
   newSlots <- mapM (spawnSlot target . slotSpec) slots
   liftIO $ atomically $ writeTVar slotsVar newSlots
 
 doRestForOne ::
   DeathTarget ->
   TVar [ChildSlot] ->
-  TQueue DeathMessage ->
   [ChildSlot] ->
   ActorId ->
   RuntimeM ()
-doRestForOne target slotsVar supDeathQ slots deadId = do
+doRestForOne target slotsVar slots deadId = do
   let (before, fromDead) = break (\s -> slotId s == deadId) slots
   case fromDead of
     []        -> return ()
     _nonempty -> do
-      liftIO $ do
-        mapM_ killSlot (drop 1 fromDead)
-        atomically $ void $ flushTQueue supDeathQ
+      liftIO $ mapM_ killSlot (drop 1 fromDead)
       newSlots <- mapM (spawnSlot target . slotSpec) fromDead
       liftIO $ atomically $ writeTVar slotsVar (before ++ newSlots)

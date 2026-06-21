@@ -71,6 +71,19 @@ library
       Control.Actor.Supervision
       Control.Actor.Network
       Control.Actor.Registry
+      FL.Types
+      FL.CRDT
+      FL.NN
+      FL.Retry
+      FL.Data.PaySim
+      FL.Actors.Logger
+      FL.Actors.Evaluator
+      FL.Actors.Trainer
+      FL.Actors.Aggregator
+      FL.Actors.Coordinator
+      FL.Actors.PeerCoordinator
+      FL.Provider
+      FL.P2P
 
     -- Modules included in this library but not exported.
     -- other-modules:
@@ -79,10 +92,34 @@ library
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.18.3.0, stm, uuid, bytestring ^>=0.12.0.0, containers ^>=0.8, mtl ^>=2.3.0, binary ^>=0.8.9, network ^>=3.2
+    build-depends:
+        base ^>=4.18.3.0,
+        stm,
+        uuid,
+        bytestring ^>=0.12.0.0,
+        containers ^>=0.8,
+        mtl ^>=2.3.0,
+        binary ^>=0.8.9,
+        network ^>=3.2,
+        hmatrix,
+        cassava,
+        vector,
+        random,
+        text,
+        time
 
     -- Directories containing source files.
     hs-source-dirs:   src
 
     -- Base language which the package is written in.
+    default-language: GHC2021
+
+executable fl-actors
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:
+        base ^>=4.18.3.0,
+        actors,
+        optparse-applicative
     default-language: GHC2021

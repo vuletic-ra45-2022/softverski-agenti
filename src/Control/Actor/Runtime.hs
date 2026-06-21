@@ -14,6 +14,7 @@ module Control.Actor.Runtime
 import Control.Actor.Transport (Transport)
 import Control.Actor.Types
 import Control.Concurrent (ThreadId)
+import Control.Exception (SomeException)
 import Control.Concurrent.MVar (MVar)
 import Control.Concurrent.STM
   ( TMVar, TVar, atomically, newTVarIO, readTVar, readTVarIO )
@@ -33,7 +34,7 @@ data Runtime = Runtime
   , rtNodeTable    :: TVar (Map.Map NodeId NodeAddr)
   , rtTransport    :: Transport
   , rtConnections  :: TVar (Map.Map NodeAddr (ActorRef NetworkMessage ()))
-  , rtConnPromises :: TVar (Map.Map NodeAddr (TMVar (ActorRef NetworkMessage ())))
+  , rtConnPromises :: TVar (Map.Map NodeAddr (TMVar (Either SomeException (ActorRef NetworkMessage ()))))
   , rtSendRemote   :: NodeAddr -> NetworkMessage -> RuntimeM ()
   }
 

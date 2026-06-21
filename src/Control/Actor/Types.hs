@@ -85,7 +85,7 @@ data NetworkMessage
   | NMCall UUID CorrelationId NodeAddr ByteString
   | NMReply CorrelationId ByteString
   | NMDeath ActorId RemoteExitReason
-  deriving (Generic)
+  deriving (Generic, Show)
 
 instance Binary NetworkMessage
 
@@ -125,10 +125,11 @@ data SupervisorAction u
   | Continue u
 
 data RegistryMsg
-  = RMRegister   String UUID
-  | RMLookup     String
-  | RMDeregister String
-  | RMDeath      UUID
+  = RMRegister        String UUID
+  | RMLookup          String
+  | RMDeregister      String
+  | RMDeath           UUID
+  | RMDeregisterNode  NodeId
   deriving (Generic)
 
 instance Binary RegistryMsg

@@ -5,6 +5,8 @@ module Control.Actor
   , module Control.Actor.Core
   , module Control.Actor.Supervision
   , module Control.Actor.Network
+  -- Initialization
+  , initRuntime
   -- Demo
   , pingActor
   , forwardActorWithCell

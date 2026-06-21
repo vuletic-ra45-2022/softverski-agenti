@@ -31,7 +31,7 @@ module Control.Actor.Core
 
 import Control.Actor.Runtime
 import Control.Actor.Types
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
@@ -52,8 +52,9 @@ import Control.Exception
   , throwIO
   , try
   )
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, join, void)
 import Data.Maybe (fromMaybe)
+import System.Timeout (timeout)
 import Control.Monad.Reader
   ( MonadIO (..)
   , MonadReader (..)
@@ -122,6 +123,7 @@ spawnActorAs ::
   u ->
   RuntimeM (ActorRef m r)
 spawnActorAs uuid actorFn deathFn initState = do
+  liftIO $ putStrLn $ "spawning actor with UUID " <> show uuid
   rt      <- ask
   mailbox <- liftIO newTQueueIO
   deathQ  <- liftIO newTQueueIO
@@ -151,7 +153,13 @@ spawnActorAs uuid actorFn deathFn initState = do
               Stop       -> return ()
               Continue u -> loop fn as {asEnv = u}
 
+  -- The thread blocks on `ready` until it is registered in rtActors:
+  -- otherwise messages dispatched by UUID in the window before the insert
+  -- would be dropped, and a death racing the insert would leave a stale
+  -- entry behind (the death path's delete running before the insert).
+  ready <- liftIO newEmptyMVar
   tid <- liftIO $ forkIO $ do
+    takeMVar ready
     result <- try @SomeException (loop actorFn actorState)
     let reason = case result of
           Right () -> Normal
@@ -167,6 +175,7 @@ spawnActorAs uuid actorFn deathFn initState = do
 
   liftIO $ atomically $
     modifyTVar (rtActors rt) (Map.insert actorId (tid, SomeActorRef actorRef))
+  liftIO $ putMVar ready ()
   return actorRef
 
 spawnActor ::
@@ -189,9 +198,16 @@ linkTo target = do
   as <- asks fst
   liftIO $ atomically $ modifyTVar (asLinks as) (target :)
 
+-- | Forcibly terminate an actor's thread. Previously this only posted a
+-- 'DeathMessage' to the target's death queue, which a deathFn returning
+-- 'Continue' would silently ignore — and even on 'Stop' the links were told
+-- the exit was 'Normal'. Killing the thread makes links see 'Killed'.
 killActor :: ActorRef m r -> ActorM u ()
-killActor (LocalRef {arDeathQ, arState}) =
-  liftIO $ atomically $ writeTQueue arDeathQ (DeathMessage (asId arState) Killed)
+killActor ref@(LocalRef {}) = do
+  rt <- asks snd
+  liftIO $ do
+    actors <- readTVarIO (rtActors rt)
+    forM_ (Map.lookup (actorRefId ref) actors) (killThread . fst)
 killActor (RemoteRef _) =
   liftIO $ putStrLn "killActor: remote kill not yet implemented"
 
@@ -206,13 +222,23 @@ cast' msg (RemoteRef (ActorId nodeId uuid)) = do
   maybeAddr <- lookupNode nodeId
   case maybeAddr of
     Nothing   -> liftIO $ putStrLn $ "cast: no node in lookup table with id " <> show nodeId
-    Just addr -> rtSendRemote rt addr (NMCast uuid (encode msg))
+    Just addr -> do
+      result <- liftIO $ try @SomeException $ withRuntime rt $ rtSendRemote rt addr (NMCast uuid (encode msg))
+      case result of
+        Left e  -> liftIO $ putStrLn $ "cast: send to " <> show addr <> " failed: " <> show e
+        Right _ -> return ()
+
+-- | How long a call waits for a reply before giving up with Nothing.
+-- Without this, a call to a dead/missing actor (or over a dead connection)
+-- would block the caller forever.
+callTimeoutMicros :: Int
+callTimeoutMicros = 10_000_000
 
 call' :: (Binary msg, Binary reply) => msg -> ActorRef msg reply -> RuntimeM (Maybe reply)
 call' msg (LocalRef {arMsgQ}) = liftIO $ do
   mv <- newEmptyMVar
   atomically $ writeTQueue arMsgQ (thisNodeId, Call msg mv)
-  takeMVar mv
+  join <$> timeout callTimeoutMicros (takeMVar mv)
 call' msg (RemoteRef (ActorId nodeId uuid)) = do
   rt <- ask
   corrId <- liftIO $ atomically $ do
@@ -229,9 +255,9 @@ call' msg (RemoteRef (ActorId nodeId uuid)) = do
       return Nothing
     Just addr -> do
       rtSendRemote rt addr (NMCall uuid corrId (rtNodeId rt) (encode msg))
-      raw <- liftIO $ takeMVar replyVar
+      raw <- liftIO $ timeout callTimeoutMicros (takeMVar replyVar)
       liftIO $ atomically $ modifyTVar (rtPending rt) (Map.delete corrId)
-      return $ Just (decode raw)
+      return $ decode <$> raw
 
 cast :: (Binary msg) => msg -> ActorRef msg reply -> ActorM u ()
 cast = (liftRuntime .) . cast'
